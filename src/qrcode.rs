@@ -9,7 +9,7 @@ pub struct TerminalQrCode {
 
 impl TerminalQrCode {
     pub fn from_bytes<D: AsRef<[u8]>>(data: D) -> TerminalQrCode {
-        let code = QrCode::with_version(data, Version::Normal(20), EcLevel::L).unwrap();
+        let code = QrCode::new(data).expect("Failed to generate QR code");
         TerminalQrCode { code }
     }
 
