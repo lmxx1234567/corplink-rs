@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - test
+  workflow_dispatch:  # Enable manual trigger
 
 jobs:
   build-windows:
@@ -29,3 +30,25 @@ jobs:
           Move-Item -Path "target/release/corplink-rs.exe" -Destination "."
           Move-Item -Path "config/config.json" -Destination "."
           Compress-Archive -Path corplink-rs.exe,config.json -Destination corplink-rs-${{ github.ref_name }}-windows.zip
+  build-macos:
+    name: build-macos
+    runs-on: macos-latest
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v4
+      - name: setup go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.22.0'
+      - name: build libwg
+        run: ./build.sh
+        working-directory: libwg
+      - name: build package
+        run: cargo build --release
+      - name: build check result
+        working-directory: target
+        run: |
+          cp release/corplink-rs .
+          cp ../config/config.json .
+          tar -czf corplink-rs-${{ github.ref_name }}-macos-$(uname -m).tar.gz corplink-rs config.json
+          tar -czf corplink-rs-${{ github.ref_name }}-macos-$(uname -m).tar.gz corplink-rs config.json
