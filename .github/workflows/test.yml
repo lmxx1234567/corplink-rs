@@ -5,11 +5,22 @@ on:
     branches:
       - test
   workflow_dispatch:  # Enable manual trigger
+    inputs:
+      target:
+        description: "Select the build target"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - windows
+          - macos
 
 jobs:
   build-windows:
     name: build-windows
     runs-on: windows-latest
+    if: ${{ inputs.target == 'all' || inputs.target == 'windows' }}
     steps:
       - name: checkout code
         uses: actions/checkout@v4
@@ -25,14 +36,21 @@ jobs:
         run: rustup default stable-x86_64-pc-windows-gnu
       - name: build package
         run: cargo build --release
-      - name: build check result
+      - name: prepare artifact
         run: |
           Move-Item -Path "target/release/corplink-rs.exe" -Destination "."
           Move-Item -Path "config/config.json" -Destination "."
           Compress-Archive -Path corplink-rs.exe,config.json -Destination corplink-rs-${{ github.ref_name }}-windows.zip
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: corplink-release-windows
+          path: corplink-rs-*.zip
+
   build-macos:
     name: build-macos
     runs-on: macos-latest
+    if: ${{ inputs.target == 'all' || inputs.target == 'macos' }}
     steps:
       - name: checkout code
         uses: actions/checkout@v4
@@ -45,10 +63,14 @@ jobs:
         working-directory: libwg
       - name: build package
         run: cargo build --release
-      - name: build check result
+      - name: prepare artifact
         working-directory: target
         run: |
           cp release/corplink-rs .
           cp ../config/config.json .
           tar -czf corplink-rs-${{ github.ref_name }}-macos-$(uname -m).tar.gz corplink-rs config.json
-          tar -czf corplink-rs-${{ github.ref_name }}-macos-$(uname -m).tar.gz corplink-rs config.json
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: corplink-release-macos
+          path: target/corplink-rs-*.tar.gz
