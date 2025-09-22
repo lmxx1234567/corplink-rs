@@ -46,6 +46,7 @@ pub struct Config {
     pub vpn_server_name: Option<String>,
     pub vpn_select_strategy: Option<String>,
     pub use_vpn_dns: Option<bool>,
+    pub log_level: Option<String>,
 }
 
 impl fmt::Display for Config {
@@ -100,9 +101,15 @@ impl Config {
                 update_conf = true;
             }
         }
+        if conf.log_level.is_none() {
+            conf.log_level = Some("warn".to_string()); // Default log level
+            update_conf = true;
+            conf.apply_log_level(); // Apply log level after loading configuration
+        }
         if update_conf {
             conf.save().await;
         }
+
         conf
     }
 
@@ -110,6 +117,21 @@ impl Config {
         let file = self.conf_file.as_ref().unwrap();
         let data = format!("{}", &self);
         fs::write(file, data).await.unwrap();
+    }
+
+    pub fn apply_log_level(&self) {
+        if let Some(ref level) = self.log_level {
+            let level_filter = match level.to_lowercase().as_str() {
+                "error" => log::LevelFilter::Error,
+                "warn" => log::LevelFilter::Warn,
+                "info" => log::LevelFilter::Info,
+                "debug" => log::LevelFilter::Debug,
+                "trace" => log::LevelFilter::Trace,
+                _ => log::LevelFilter::Warn, // Default to warn if invalid
+            };
+            log::set_max_level(level_filter);
+            log::info!("Log level set to: {}", level_filter);
+        }
     }
 }
 

@@ -44,7 +44,6 @@ jobs:
       - name: upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: corplink-release-windows
           path: corplink-rs-*.zip
 
   build-macos:
@@ -72,5 +71,4 @@ jobs:
       - name: upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: corplink-release-macos
           path: target/corplink-rs-*.tar.gz
