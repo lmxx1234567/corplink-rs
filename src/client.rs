@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::error::Error as StdError;
 use std::fmt;
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -15,7 +18,7 @@ use reqwest::cookie::CookieStore as ReqwestCookieStore;
 use reqwest::header;
 use reqwest::{ClientBuilder, Response, Url};
 use reqwest_cookie_store::CookieStoreMutex;
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::Digest;
 
@@ -24,7 +27,6 @@ use crate::config::{
     Config, WgConf, PLATFORM_CORPLINK, PLATFORM_CORPLINK_V1, PLATFORM_LARK, PLATFORM_LDAP,
     PLATFORM_OIDC, STRATEGY_DEFAULT, STRATEGY_LATENCY,
 };
-use crate::qrcode::TerminalQrCode;
 use crate::resp::*;
 use crate::state::State;
 use crate::totp::{totp_offset, TIME_STEP};
@@ -35,6 +37,145 @@ const SIGN_ROOT_KEY_VERSION: u64 = 1;
 const SIGN_SECRET: &[u8] = b"TOK@@AoNfRIX+3bla%";
 const SIGN_HASH_BLOCK_SIZE: usize = 64;
 const SIGN_HASH_OUTPUT_SIZE: usize = 32;
+const AUTH_EXPIRED_CODE: i32 = 101;
+const AUTH_REQUEST_PATH: &str = "/run/corplink-rs/auth-request.json";
+const AUTH_REQUEST_SCHEMA_VERSION: u32 = 1;
+const TPS_AUTH_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const TPS_AUTH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Debug)]
+pub struct AuthenticationExpired {
+    detail: String,
+}
+
+impl fmt::Display for AuthenticationExpired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "authentication expired: {}", self.detail)
+    }
+}
+
+impl StdError for AuthenticationExpired {}
+
+#[derive(Debug)]
+struct TpsAuthenticationTimeout;
+
+impl fmt::Display for TpsAuthenticationTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "timed out waiting for SSO authentication")
+    }
+}
+
+impl StdError for TpsAuthenticationTimeout {}
+
+#[derive(Debug, PartialEq)]
+enum TpsTokenStatus {
+    Pending,
+    Authenticated(String),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct AuthRequest<'a> {
+    schema_version: u32,
+    event_id: &'a str,
+    created_at: String,
+    method: &'a str,
+    url: &'a str,
+}
+
+fn new_auth_event_id() -> String {
+    use rand::RngCore;
+
+    let mut bytes = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn write_auth_request(path: &Path, event_id: &str, method: &str, url: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("authentication request path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create authentication request directory {}",
+            parent.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!(
+                "failed to secure authentication request directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let request = AuthRequest {
+        schema_version: AUTH_REQUEST_SCHEMA_VERSION,
+        event_id,
+        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        method,
+        url,
+    };
+    let mut contents =
+        serde_json::to_vec(&request).context("failed to serialize authentication request")?;
+    contents.push(b'\n');
+
+    let temp_path = parent.join(format!(".auth-request.json.{event_id}.tmp"));
+    let write_result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp_path).with_context(|| {
+            format!(
+                "failed to create authentication request temporary file {}",
+                temp_path.display()
+            )
+        })?;
+        file.write_all(&contents)
+            .context("failed to write authentication request")?;
+        file.sync_all()
+            .context("failed to sync authentication request")?;
+        fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "failed to publish authentication request at {}",
+                path.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+fn remove_auth_request(path: &Path, event_id: &str) -> Result<()> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to read authentication request {}", path.display())
+            })
+        }
+    };
+    let request: AuthRequest<'_> = serde_json::from_str(&contents)
+        .context("failed to parse authentication request before removal")?;
+    if request.event_id == event_id {
+        fs::remove_file(path).with_context(|| {
+            format!("failed to remove authentication request {}", path.display())
+        })?;
+    }
+    Ok(())
+}
 
 fn merge_additional_routes(
     mut routes: Vec<String>,
@@ -366,6 +507,7 @@ impl Client {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true)
             .append(false)
             .open(&cookie_file)
             .map(io::BufWriter::new)
@@ -539,9 +681,16 @@ impl Client {
             .await
             .with_context(|| format!("request {api:?} failed"))?;
 
+        if matches!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            let status = resp.status();
+            self.handle_authentication_expired(format!("server returned HTTP {status}"))
+                .await?;
+        }
         if !resp.status().is_success() {
-            let msg = format!("logout because of bad resp code: {}", resp.status());
-            self.handle_logout_err(msg).await?;
+            bail!("request {api:?} returned HTTP {}", resp.status());
         }
 
         self.parse_time_offset_from_date_header(&resp);
@@ -561,12 +710,18 @@ impl Client {
         // expired the server returns a non-zero code (e.g. 101) with a `data`
         // whose shape doesn't match T (ListVPN, for instance, gets an object where
         // it expects an array). Deserializing straight into Resp<T> would fail here
-        // and bypass the code-based logout/retry handling, leaving a stale-session
-        // run dead with a confusing parse error. So only coerce `data` into T once
-        // we know code == 0; otherwise keep the code/message so callers can react.
-        let raw: Resp<Value> = serde_json::from_str(&text).with_context(|| {
-            format!("failed to parse response envelope for api {api:?}: {text}")
-        })?;
+        // and bypass the typed authentication-expiration handling, leaving a
+        // stale-session run dead with a confusing parse error. So only coerce
+        // `data` into T once we know code == 0.
+        let raw: Resp<Value> = serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse response envelope for api {api:?}"))?;
+        if raw.code == AUTH_EXPIRED_CODE {
+            self.handle_authentication_expired(format!(
+                "server returned authentication-expired code {AUTH_EXPIRED_CODE}"
+            ))
+            .await?;
+            unreachable!("authentication expiration always returns an error");
+        }
         let data = match (raw.code, raw.data) {
             (0, Some(v)) => Some(
                 serde_json::from_value::<T>(v)
@@ -580,7 +735,13 @@ impl Client {
             data,
             action: raw.action,
         };
-        log::debug!("api {:#?} resp: {:#?}", api, resp);
+        log::debug!(
+            "api {:?} response: code={}, has_data={}, has_action={}",
+            api,
+            resp.code,
+            resp.data.is_some(),
+            resp.action.is_some()
+        );
         Ok(resp)
     }
 
@@ -617,7 +778,7 @@ impl Client {
         matches!(self.conf.state.as_ref(), None | Some(State::Init))
     }
 
-    async fn check_tps_token(&mut self, token: &String) -> Result<String> {
+    async fn check_tps_token(&mut self, token: &str) -> Result<TpsTokenStatus> {
         // tps confirmed, try to login with token
         let mut m = Map::new();
         m.insert("token".to_string(), json!(token));
@@ -626,15 +787,66 @@ impl Client {
             .request::<RespLogin>(ApiName::TpsTokenCheck, Some(m))
             .await?;
         match resp.code {
-            0 => resp
-                .data
-                .context("tps token check missing redirect url")
-                .map(|d| d.url),
-            _ => {
-                let msg = resp
-                    .message
-                    .unwrap_or_else(|| "tps token check failed".to_string());
-                bail!(msg)
+            0 => match resp.data.map(|data| data.url).filter(|url| !url.is_empty()) {
+                Some(url) => Ok(TpsTokenStatus::Authenticated(url)),
+                None => Ok(TpsTokenStatus::Pending),
+            },
+            // The endpoint uses an application-level non-zero response while the
+            // browser-side SSO flow has not completed. Transport/protocol errors
+            // still propagate as errors, so a broken service does not look pending.
+            _ => Ok(TpsTokenStatus::Pending),
+        }
+    }
+
+    async fn wait_for_tps_authentication(
+        &mut self,
+        token: &str,
+        poll_interval: Duration,
+        auth_timeout: Duration,
+    ) -> Result<String> {
+        tokio::time::timeout(auth_timeout, async {
+            loop {
+                tokio::time::sleep(poll_interval).await;
+                match self.check_tps_token(token).await? {
+                    TpsTokenStatus::Pending => continue,
+                    TpsTokenStatus::Authenticated(url) => return Ok(url),
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!(TpsAuthenticationTimeout))?
+    }
+
+    async fn get_otp_uri_from_tps_with_options(
+        &mut self,
+        method: &str,
+        url: &str,
+        token: &str,
+        auth_request_path: &Path,
+        poll_interval: Duration,
+        auth_timeout: Duration,
+    ) -> Result<String> {
+        match method {
+            PLATFORM_LARK | PLATFORM_OIDC => {}
+            _ => bail!("unsupported platform, please contact the developer"),
+        }
+
+        let event_id = new_auth_event_id();
+        write_auth_request(auth_request_path, &event_id, method, url)?;
+        log::info!("authentication requested: event_id={event_id}");
+
+        let result = self
+            .wait_for_tps_authentication(token, poll_interval, auth_timeout)
+            .await;
+        match result {
+            Ok(otp_uri) => {
+                remove_auth_request(auth_request_path, &event_id)?;
+                log::info!("authentication completed: event_id={event_id}");
+                Ok(otp_uri)
+            }
+            Err(err) => {
+                log::warn!("authentication request failed: event_id={event_id}");
+                Err(err)
             }
         }
     }
@@ -642,29 +854,18 @@ impl Client {
     async fn get_otp_uri_from_tps(
         &mut self,
         method: &str,
-        url: &String,
-        token: &String,
+        url: &str,
+        token: &str,
     ) -> Result<String> {
-        log::info!("old token is: {token}");
-        log::info!("please scan the QR code or visit the following link to auth corplink:\n{url}");
-        match TerminalQrCode::from_bytes(url.as_bytes()) {
-            Ok(qr) => qr.print(),
-            Err(e) => {
-                log::warn!("failed to generate qr code: {e}");
-            }
-        }
-        match method {
-            PLATFORM_LARK | PLATFORM_OIDC => {
-                log::info!("press enter if you finish auth");
-                let stdin = io::stdin();
-                stdin.lines().next();
-                self.check_tps_token(token).await
-            }
-            _ => {
-                // TODO: add all tps login support
-                bail!("unsupported platform, please contact the developer");
-            }
-        }
+        self.get_otp_uri_from_tps_with_options(
+            method,
+            url,
+            token,
+            Path::new(AUTH_REQUEST_PATH),
+            TPS_AUTH_POLL_INTERVAL,
+            TPS_AUTH_TIMEOUT,
+        )
+        .await
     }
 
     async fn corplink_login(&mut self) -> Result<String> {
@@ -814,7 +1015,6 @@ impl Client {
                         let url = Url::parse(&otp_uri).context("failed to parse otp uri")?;
                         for (k, v) in url.query_pairs() {
                             if k == "secret" {
-                                log::info!("got 2fa token: {}", &v);
                                 self.conf.code = Some(v.to_string());
                                 self.conf.save().await?;
                                 break;
@@ -852,11 +1052,13 @@ impl Client {
         }
         for method in resp.login_orders {
             let otp_uri = self.get_otp_uri_by_otp(&tps_login, &method).await;
-            if let Err(e) = otp_uri {
-                log::warn!("failed to login with method {method}: {e}");
-                continue;
-            }
-            let otp_uri = otp_uri?;
+            let otp_uri = match otp_uri {
+                Ok(otp_uri) => otp_uri,
+                Err(err) => {
+                    log::warn!("failed to login with method {method}: {err}");
+                    continue;
+                }
+            };
             if otp_uri.is_empty() {
                 log::info!("no otp code from server, will ask for 2fa code when connecting");
                 self.change_state(State::Login).await?;
@@ -867,7 +1069,6 @@ impl Client {
             let url = Url::parse(&otp_uri).context("failed to parse otp uri")?;
             for (k, v) in url.query_pairs() {
                 if k == "secret" {
-                    log::info!("got 2fa token: {}", &v);
                     self.conf.code = Some(v.to_string());
                     self.conf.save().await?;
                     break;
@@ -986,18 +1187,17 @@ impl Client {
         match resp.code {
             0 => Ok(resp.data.context("email login response missing data")?.url),
             _ => bail!(format!(
-                "failed to login with email code {}: {}",
-                code,
+                "failed to login with email code: {}",
                 resp.message.unwrap_or_else(|| "unknown error".to_string())
             )),
         }
     }
 
-    async fn handle_logout_err(&mut self, msg: String) -> Result<()> {
+    async fn handle_authentication_expired(&mut self, detail: String) -> Result<()> {
         self.change_state(State::Init)
             .await
-            .context("failed to reset state after logout")?;
-        bail!("operation failed because of logout: {msg}")
+            .context("failed to reset state after authentication expiration")?;
+        Err(AuthenticationExpired { detail }.into())
     }
 
     async fn list_vpn(&mut self) -> Result<Vec<RespVpnInfo>> {
@@ -1006,11 +1206,11 @@ impl Client {
             .await?;
         match resp.code {
             0 => resp.data.context("list vpn response missing data"),
-            101 => {
+            AUTH_EXPIRED_CODE => {
                 let msg = resp
                     .message
-                    .unwrap_or_else(|| "logout required".to_string());
-                self.handle_logout_err(msg).await?;
+                    .unwrap_or_else(|| "authentication expired".to_string());
+                self.handle_authentication_expired(msg).await?;
                 unreachable!()
             }
             _ => bail!(format!(
@@ -1235,11 +1435,7 @@ impl Client {
                 let offset = self.date_offset_sec / TIME_STEP as i32;
                 let raw_otp = totp_offset(code.as_slice(), offset);
                 otp = format!("{:06}", raw_otp.code);
-                log::info!(
-                    "2fa code generated: {}, {} seconds left",
-                    &otp,
-                    raw_otp.secs_left
-                );
+                log::info!("2fa code generated, {} seconds left", raw_otp.secs_left);
             }
         }
         if otp.is_empty() {
@@ -1262,11 +1458,11 @@ impl Client {
             .await?;
         match resp.code {
             0 => resp.data.context("connect vpn response missing data"),
-            101 => {
+            AUTH_EXPIRED_CODE => {
                 let msg = resp
                     .message
-                    .unwrap_or_else(|| "logout required".to_string());
-                self.handle_logout_err(msg).await?;
+                    .unwrap_or_else(|| "authentication expired".to_string());
+                self.handle_authentication_expired(msg).await?;
                 unreachable!()
             }
             _ => bail!(format!(
@@ -1639,6 +1835,8 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1649,11 +1847,14 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        encode_sign_header, hkdf_sha256, merge_additional_routes, resolve_additional_domains,
-        Client, ReqwestCookieStore,
+        encode_sign_header, hkdf_sha256, merge_additional_routes, remove_auth_request,
+        resolve_additional_domains, write_auth_request, AuthRequest, Client, ReqwestCookieStore,
+        TpsAuthenticationTimeout, AUTH_REQUEST_SCHEMA_VERSION,
     };
+    use crate::api::ApiUrl;
     use crate::config::Config;
     use crate::resp::RespVpnInfo;
+    use crate::state::State;
     use crate::utils::apply_route_filters;
 
     #[test]
@@ -1724,6 +1925,50 @@ mod tests {
         (port, request_rx, task)
     }
 
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut buffer).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+    }
+
+    async fn start_tps_server(
+        responses: Vec<&'static str>,
+        repeat_last: bool,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        assert!(!responses.is_empty());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let mut response_index = 0;
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_request(&mut stream).await;
+                let body = responses[response_index];
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+
+                if response_index + 1 < responses.len() {
+                    response_index += 1;
+                } else if !repeat_last {
+                    break;
+                }
+            }
+        });
+        (port, task)
+    }
+
     fn vpn_info(port: u16, name: &str) -> RespVpnInfo {
         RespVpnInfo {
             api_port: port,
@@ -1758,6 +2003,192 @@ mod tests {
                 .into_owned(),
         );
         Client::new(conf).unwrap()
+    }
+
+    fn test_client_for_server(port: u16) -> Client {
+        let mut client = test_client();
+        client.conf.server = Some(format!("http://127.0.0.1:{port}"));
+        client.api_url = ApiUrl::new(&client.conf).unwrap();
+        client
+    }
+
+    fn temporary_auth_request_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("corplink-auth-request-{name}-{unique}"))
+            .join("auth-request.json")
+    }
+
+    fn remove_auth_test_directory(path: &Path) {
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn auth_request_is_atomic_root_only_json_and_event_guarded() {
+        let path = temporary_auth_request_path("json");
+        write_auth_request(
+            &path,
+            "0123456789abcdef",
+            "OIDC",
+            "https://login.example.test/secret",
+        )
+        .unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let request: AuthRequest<'_> = serde_json::from_str(&contents).unwrap();
+        assert_eq!(request.schema_version, AUTH_REQUEST_SCHEMA_VERSION);
+        assert_eq!(request.event_id, "0123456789abcdef");
+        assert_eq!(request.method, "OIDC");
+        assert_eq!(request.url, "https://login.example.test/secret");
+        assert!(chrono::DateTime::parse_from_rfc3339(&request.created_at).is_ok());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&contents)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            5
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(!path
+            .parent()
+            .unwrap()
+            .join(".auth-request.json.0123456789abcdef.tmp")
+            .exists());
+
+        remove_auth_request(&path, "different-event").unwrap();
+        assert!(path.exists());
+        remove_auth_request(&path, "0123456789abcdef").unwrap();
+        assert!(!path.exists());
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sso_polling_transitions_from_pending_to_success_and_removes_request() {
+        let (port, server) = start_tps_server(
+            vec![
+                r#"{"code":1,"message":"pending"}"#,
+                r#"{"code":0,"data":{"url":"otpauth://totp/test?secret=SAFE"}}"#,
+            ],
+            false,
+        )
+        .await;
+        let mut client = test_client_for_server(port);
+        let path = temporary_auth_request_path("success");
+
+        let result = client
+            .get_otp_uri_from_tps_with_options(
+                "OIDC",
+                "https://login.example.test/request",
+                "opaque-token",
+                &path,
+                Duration::from_millis(5),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, "otpauth://totp/test?secret=SAFE");
+        assert!(!path.exists());
+        server.await.unwrap();
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sso_polling_times_out_and_keeps_request() {
+        let (port, server) =
+            start_tps_server(vec![r#"{"code":1,"message":"pending"}"#], true).await;
+        let mut client = test_client_for_server(port);
+        let path = temporary_auth_request_path("timeout");
+
+        let error = client
+            .get_otp_uri_from_tps_with_options(
+                "OIDC",
+                "https://login.example.test/request",
+                "opaque-token",
+                &path,
+                Duration::from_millis(5),
+                Duration::from_millis(30),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<TpsAuthenticationTimeout>().is_some());
+        assert!(path.exists());
+        server.abort();
+        remove_auth_test_directory(&path);
+    }
+
+    #[tokio::test]
+    async fn sso_polling_propagates_network_errors_and_keeps_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut client = test_client_for_server(port);
+        let path = temporary_auth_request_path("network");
+
+        let error = client
+            .get_otp_uri_from_tps_with_options(
+                "OIDC",
+                "https://login.example.test/request",
+                "opaque-token",
+                &path,
+                Duration::ZERO,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<TpsAuthenticationTimeout>().is_none());
+        assert!(format!("{error:#}").contains("request TpsTokenCheck failed"));
+        assert!(path.exists());
+        remove_auth_test_directory(&path);
+    }
+
+    #[tokio::test]
+    async fn authentication_expiration_is_a_typed_error_and_resets_state() {
+        use anyhow::Context;
+
+        let (port, server) =
+            start_tps_server(vec![r#"{"code":101,"message":"session expired"}"#], false).await;
+        let mut client = test_client_for_server(port);
+        client.conf.state = Some(State::Login);
+        let config_path = client.conf.conf_file.clone().unwrap();
+
+        let error = client
+            .check_tps_token("opaque-token")
+            .await
+            .context("login failed")
+            .unwrap_err();
+
+        assert!(error
+            .downcast_ref::<super::AuthenticationExpired>()
+            .is_some());
+        assert!(client.need_login());
+        server.await.unwrap();
+        fs::remove_file(config_path).unwrap();
     }
 
     #[tokio::test]

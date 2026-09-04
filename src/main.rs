@@ -2,7 +2,6 @@ mod api;
 mod client;
 mod config;
 mod dns;
-mod qrcode;
 mod resp;
 mod state;
 mod template;
@@ -21,7 +20,7 @@ use std::process::exit;
 
 use anyhow::{anyhow, Context, Result};
 
-use client::Client;
+use client::{AuthenticationExpired, Client};
 use config::{Config, WgConf};
 
 fn print_usage_and_exit(name: &str, conf: &str) {
@@ -122,26 +121,30 @@ async fn run() -> Result<()> {
     let with_wg_log = conf.debug_wg.unwrap_or_default();
     let platform = conf.platform.clone();
     let mut c = Client::new(conf).context("failed to initialize client")?;
-    let mut logout_retry = true;
+    let mut authentication_retry = true;
     let wg_conf: Option<WgConf>;
 
     loop {
-        if c.need_login() {
-            log::info!("not login yet, try to login");
-            c.login().await.context("login failed")?;
-            log::info!("login success");
+        let connect_result = async {
+            if c.need_login() {
+                log::info!("not login yet, try to login");
+                c.login().await.context("login failed")?;
+                log::info!("login success");
+            }
+            log::info!("try to connect");
+            c.connect_vpn().await
         }
-        log::info!("try to connect");
-        match c.connect_vpn().await {
+        .await;
+
+        match connect_result {
             Ok(conf) => {
                 wg_conf = Some(conf);
                 break;
             }
             Err(e) => {
-                if logout_retry && e.to_string().contains("logout") {
-                    // e contains detail message, so just print it out
+                if authentication_retry && e.downcast_ref::<AuthenticationExpired>().is_some() {
                     log::warn!("{}", e);
-                    logout_retry = false;
+                    authentication_retry = false;
                     continue;
                 } else {
                     return Err(e);
