@@ -2,6 +2,8 @@
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
+pub const CONTROL_CAPABILITIES: &str = if cfg!(unix) { "renew-marker-v1" } else { "" };
+
 pub fn consume_request() -> Result<Option<String>> {
     #[cfg(unix)]
     {
@@ -50,8 +52,16 @@ pub fn write_completed(operation_id: &str) -> Result<()> {
 }
 
 fn write_completed_at(path: &Path, operation_id: &str) -> Result<()> {
+    let temporary = path.with_extension(format!(
+        "{}.{:032x}.tmp",
+        std::process::id(),
+        rand::random::<u128>()
+    ));
+    publish_completed(path, &temporary, operation_id)
+}
+
+fn publish_completed(path: &Path, temporary: &Path, operation_id: &str) -> Result<()> {
     use std::io::Write;
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -59,8 +69,11 @@ fn write_completed_at(path: &Path, operation_id: &str) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    // Only clean up after we have successfully created and own this file.
+    let mut file = options
+        .open(temporary)
+        .context("cannot create renewal completion receipt")?;
     let result = (|| -> Result<()> {
-        let mut file = options.open(&temporary)?;
         serde_json::to_writer(
             &mut file,
             &serde_json::json!({
@@ -70,11 +83,12 @@ fn write_completed_at(path: &Path, operation_id: &str) -> Result<()> {
         )?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
+        std::fs::rename(temporary, path)?;
         Ok(())
     })();
+    drop(file);
     if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+        let _ = std::fs::remove_file(temporary);
     }
     result.context("cannot publish renewal completion receipt")
 }
@@ -83,6 +97,36 @@ fn write_completed_at(path: &Path, operation_id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    #[test]
+    fn stale_receipts_do_not_block_publication_or_get_deleted() {
+        let dir = std::env::temp_dir().join(format!("corplink-receipt-{}", rand::random::<u128>()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("completed.json");
+        let stale = path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&stale, "stale receipt").unwrap();
+        write_completed_at(&path, "0123456789abcdef0123456789abcdef").unwrap();
+        assert_eq!(std::fs::read_to_string(&stale).unwrap(), "stale receipt");
+        let receipt = std::fs::read(&path).unwrap();
+        assert!(publish_completed(&path, &stale, "different-operation").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), receipt);
+        assert_eq!(std::fs::read_to_string(&stale).unwrap(), "stale receipt");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_publication_cleans_up_owned_temporary_file() {
+        let dir =
+            std::env::temp_dir().join(format!("corplink-receipt-fail-{}", rand::random::<u128>()));
+        std::fs::create_dir(&dir).unwrap();
+        let temporary = dir.join("owned.tmp");
+        // A directory cannot be replaced by the receipt file.
+        assert!(publish_completed(&dir, &temporary, "0123456789abcdef0123456789abcdef").is_err());
+        assert!(!temporary.exists());
+        assert!(dir.is_dir());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn request_is_one_shot_and_rejects_unsafe_files() {
         let dir = std::env::temp_dir().join(format!(
@@ -122,5 +166,21 @@ mod tests {
         symlink(&target, &path).unwrap();
         assert!(consume_at(&path, uid).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_match_platform_support() {
+        #[cfg(unix)]
+        assert_eq!(CONTROL_CAPABILITIES, "renew-marker-v1");
+        #[cfg(not(unix))]
+        {
+            assert!(CONTROL_CAPABILITIES.is_empty());
+            assert!(consume_request().is_err());
+        }
     }
 }

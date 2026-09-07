@@ -55,7 +55,9 @@ pub const ETIMEDOUT: i32 = 110;
 #[tokio::main]
 async fn main() {
     if env::args().skip(1).collect::<Vec<_>>() == ["--control-capabilities"] {
-        println!("renew-marker-v1");
+        if !renew::CONTROL_CAPABILITIES.is_empty() {
+            println!("{}", renew::CONTROL_CAPABILITIES);
+        }
         return;
     }
     if let Err(err) = run().await {

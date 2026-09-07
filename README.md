@@ -443,7 +443,7 @@ graph TD;
 
 ### 外部控制器主动重新认证
 
-`corplink-rs --control-capabilities` 输出 `renew-marker-v1`，无需读取配置或启动 VPN。
+`corplink-rs --control-capabilities` 在 Unix 上输出 `renew-marker-v1`，不支持的平台输出为空；无需读取配置或启动 VPN。
 使用 `corplink-rs --renew-if-requested /path/to/config.json` 启动时，客户端检查
 `/run/corplink-rs/renew-request.json`。无请求文件时沿用正常登录流程。
 
