@@ -73,6 +73,8 @@ systemctl enable corplink-rs.service
 systemctl start corplink-rs@test.service
 ```
 
+使用 `lark` 或 `OIDC` 登录时，systemd 日志只会输出本次认证的 `event_id`。完整认证地址会以 `0600` 权限原子写入 `/run/corplink-rs/auth-request.json`，其中包含 `schema_version`、`event_id`、`created_at`、`method` 和 `url`。客户端每 5 秒检查一次认证状态，最长等待 10 分钟；认证成功后立即删除该文件并继续建立 VPN。超时或网络错误时文件会保留，便于外部监控发现并处理。
+
 ## windows 使用说明
 
 ### 快速开始（推荐使用预编译版本）

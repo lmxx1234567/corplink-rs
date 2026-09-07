@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::error::Error as StdError;
 use std::fmt;
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -15,7 +18,7 @@ use reqwest::cookie::CookieStore as ReqwestCookieStore;
 use reqwest::header;
 use reqwest::{ClientBuilder, Response, Url};
 use reqwest_cookie_store::CookieStoreMutex;
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::Digest;
 
@@ -24,13 +27,155 @@ use crate::config::{
     Config, WgConf, PLATFORM_CORPLINK, PLATFORM_CORPLINK_V1, PLATFORM_LARK, PLATFORM_LDAP,
     PLATFORM_OIDC, STRATEGY_DEFAULT, STRATEGY_LATENCY,
 };
-use crate::qrcode::TerminalQrCode;
 use crate::resp::*;
 use crate::state::State;
 use crate::totp::{totp_offset, TIME_STEP};
 use crate::utils;
 
 const COOKIE_FILE_SUFFIX: &str = "cookies.json";
+const SIGN_ROOT_KEY_VERSION: u64 = 1;
+const SIGN_SECRET: &[u8] = b"TOK@@AoNfRIX+3bla%";
+const SIGN_HASH_BLOCK_SIZE: usize = 64;
+const SIGN_HASH_OUTPUT_SIZE: usize = 32;
+const AUTH_EXPIRED_CODE: i32 = 101;
+const AUTH_REQUEST_PATH: &str = "/run/corplink-rs/auth-request.json";
+const AUTH_REQUEST_SCHEMA_VERSION: u32 = 1;
+const TPS_AUTH_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const TPS_AUTH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Debug)]
+pub struct AuthenticationExpired {
+    detail: String,
+}
+
+impl fmt::Display for AuthenticationExpired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "authentication expired: {}", self.detail)
+    }
+}
+
+impl StdError for AuthenticationExpired {}
+
+#[derive(Debug)]
+struct TpsAuthenticationTimeout;
+
+impl fmt::Display for TpsAuthenticationTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "timed out waiting for SSO authentication")
+    }
+}
+
+impl StdError for TpsAuthenticationTimeout {}
+
+#[derive(Debug, PartialEq)]
+enum TpsTokenStatus {
+    Pending,
+    Authenticated(String),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct AuthRequest<'a> {
+    schema_version: u32,
+    event_id: &'a str,
+    created_at: String,
+    method: &'a str,
+    url: &'a str,
+}
+
+fn new_auth_event_id() -> String {
+    use rand::RngCore;
+
+    let mut bytes = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn write_auth_request(path: &Path, event_id: &str, method: &str, url: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("authentication request path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create authentication request directory {}",
+            parent.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!(
+                "failed to secure authentication request directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let request = AuthRequest {
+        schema_version: AUTH_REQUEST_SCHEMA_VERSION,
+        event_id,
+        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        method,
+        url,
+    };
+    let mut contents =
+        serde_json::to_vec(&request).context("failed to serialize authentication request")?;
+    contents.push(b'\n');
+
+    let temp_path = parent.join(format!(".auth-request.json.{event_id}.tmp"));
+    let write_result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp_path).with_context(|| {
+            format!(
+                "failed to create authentication request temporary file {}",
+                temp_path.display()
+            )
+        })?;
+        file.write_all(&contents)
+            .context("failed to write authentication request")?;
+        file.sync_all()
+            .context("failed to sync authentication request")?;
+        fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "failed to publish authentication request at {}",
+                path.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+fn remove_auth_request(path: &Path, event_id: &str) -> Result<()> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to read authentication request {}", path.display())
+            })
+        }
+    };
+    let request: AuthRequest<'_> = serde_json::from_str(&contents)
+        .context("failed to parse authentication request before removal")?;
+    if request.event_id == event_id {
+        fs::remove_file(path).with_context(|| {
+            format!("failed to remove authentication request {}", path.display())
+        })?;
+    }
+    Ok(())
+}
 
 fn merge_additional_routes(
     mut routes: Vec<String>,
@@ -56,10 +201,7 @@ fn merge_additional_routes(
     routes
 }
 
-async fn resolve_additional_domains(
-    domains: &[String],
-    has_ipv6_address: bool,
-) -> Vec<String> {
+async fn resolve_additional_domains(domains: &[String], has_ipv6_address: bool) -> Vec<String> {
     let mut routes = Vec::new();
     for configured_domain in domains {
         let domain = configured_domain.trim();
@@ -114,6 +256,88 @@ async fn resolve_additional_domains(
     routes
 }
 
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; SIGN_HASH_OUTPUT_SIZE] {
+    let mut key_block = [0u8; SIGN_HASH_BLOCK_SIZE];
+    if key.len() > SIGN_HASH_BLOCK_SIZE {
+        key_block[..SIGN_HASH_OUTPUT_SIZE].copy_from_slice(&sha2::Sha256::digest(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; SIGN_HASH_BLOCK_SIZE];
+    let mut opad = [0x5cu8; SIGN_HASH_BLOCK_SIZE];
+    for i in 0..SIGN_HASH_BLOCK_SIZE {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+
+    let mut inner = sha2::Sha256::new();
+    inner.update(ipad);
+    inner.update(data);
+    let inner = inner.finalize();
+
+    let mut outer = sha2::Sha256::new();
+    outer.update(opad);
+    outer.update(inner);
+    outer.finalize().into()
+}
+
+fn hkdf_sha256(secret: &[u8], salt: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+    let zero_salt = [0u8; SIGN_HASH_OUTPUT_SIZE];
+    let prk = if salt.is_empty() {
+        hmac_sha256(&zero_salt, secret)
+    } else {
+        hmac_sha256(salt, secret)
+    };
+
+    let mut okm = Vec::with_capacity(len);
+    let mut previous = Vec::new();
+    let mut counter = 1u8;
+    while okm.len() < len {
+        let mut input = Vec::with_capacity(previous.len() + info.len() + 1);
+        input.extend_from_slice(&previous);
+        input.extend_from_slice(info);
+        input.push(counter);
+        previous = hmac_sha256(&prk, &input).to_vec();
+        okm.extend_from_slice(&previous);
+        counter = counter.wrapping_add(1);
+    }
+    okm.truncate(len);
+    okm
+}
+
+fn write_pb_varint(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn write_pb_field_varint(field: u64, value: u64, out: &mut Vec<u8>) {
+    write_pb_varint(field << 3, out);
+    write_pb_varint(value, out);
+}
+
+fn write_pb_field_bytes(field: u64, value: &[u8], out: &mut Vec<u8>) {
+    write_pb_varint((field << 3) | 2, out);
+    write_pb_varint(value.len() as u64, out);
+    out.extend_from_slice(value);
+}
+
+fn encode_sign_header(signing_input_params: u64, signing_result: &[u8]) -> String {
+    let mut body = Vec::with_capacity(40);
+    write_pb_field_varint(1, SIGN_ROOT_KEY_VERSION, &mut body);
+    write_pb_field_varint(3, signing_input_params, &mut body);
+    write_pb_field_bytes(4, signing_result, &mut body);
+
+    use base64::Engine;
+    format!(
+        "v1;{}",
+        base64::engine::general_purpose::STANDARD.encode(body)
+    )
+}
+
 fn corplink_client_builder() -> ClientBuilder {
     ClientBuilder::new()
         // CorpLink deployments may use certificates signed by their own CA.
@@ -121,7 +345,7 @@ fn corplink_client_builder() -> ClientBuilder {
         // for debug
         // .proxy(reqwest::Proxy::all("socks5://192.168.111.233:8001").unwrap())
         .user_agent(format!(
-            "CorpLink/{CORPLINK_APP_VERSION} (GooglePixel; Android 10; en)"
+            "CorpLink/{CORPLINK_APP_VERSION} (linux; Linux; en)"
         ))
         .timeout(Duration::from_millis(10000))
 }
@@ -194,12 +418,13 @@ impl Client {
         let mut cookie_store = {
             let file = fs::File::open(&cookie_file).map(io::BufReader::new);
             match file {
-                Ok(file) => CookieStore::load_json_all(file).or_else(|e| {
-                    bail!(
-                        "failed to load cookie store from {}: {e}",
+                Ok(file) => CookieStore::load_json_all(file).unwrap_or_else(|e| {
+                    log::warn!(
+                        "failed to load cookie store from {}, using empty store: {e}",
                         cookie_file.display()
-                    )
-                })?,
+                    );
+                    CookieStore::default()
+                }),
                 Err(_) => CookieStore::default(),
             }
         };
@@ -264,18 +489,34 @@ impl Client {
     }
 
     fn save_cookie(&self) -> Result<()> {
+        let f = self
+            .conf
+            .conf_file
+            .as_ref()
+            .context("config file path missing")?;
         let interface_name = self
             .conf
             .interface_name
             .as_ref()
             .context("interface name missing in config")?;
+        let dir = match path::Path::new(f).parent() {
+            Some(dir) => dir,
+            None => path::Path::new("."),
+        };
+        let cookie_file = dir.join(format!("{}_{}", interface_name, COOKIE_FILE_SUFFIX));
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true)
             .append(false)
-            .open(format!("{}_{}", interface_name, COOKIE_FILE_SUFFIX))
+            .open(&cookie_file)
             .map(io::BufWriter::new)
-            .with_context(|| "failed to open cookie file for writing")?;
+            .with_context(|| {
+                format!(
+                    "failed to open cookie file for writing: {}",
+                    cookie_file.display()
+                )
+            })?;
         let c = self
             .cookie
             .lock()
@@ -285,33 +526,171 @@ impl Client {
         Ok(())
     }
 
+    fn cookie_header_for_url(&self, url: &Url) -> Result<Option<header::HeaderValue>> {
+        Ok(ReqwestCookieStore::cookies(self.cookie.as_ref(), url))
+    }
+
+    fn csrf_token_for_url(&self, url: &Url) -> Result<Option<header::HeaderValue>> {
+        self.cookie_value_for_url(url, "csrf-token")
+            .and_then(|value| {
+                value
+                    .map(|value| {
+                        header::HeaderValue::from_str(&value)
+                            .context("invalid csrf-token header value")
+                    })
+                    .transpose()
+            })
+    }
+
+    fn cookie_value_for_url(&self, url: &Url, name: &str) -> Result<Option<String>> {
+        let cookie_store = self
+            .cookie
+            .lock()
+            .map_err(|e| anyhow!("failed to lock cookie store: {e}"))?;
+        let Some(domain) = url.domain().or_else(|| url.host_str()) else {
+            return Ok(None);
+        };
+        Ok(cookie_store
+            .get(domain, "/", name)
+            .map(|cookie| cookie.value().to_string()))
+    }
+
+    fn signing_input_params(api: &ApiName) -> Option<u64> {
+        match api {
+            ApiName::ListVPN => Some(510),
+            ApiName::ConnectVPN => Some(542),
+            _ => None,
+        }
+    }
+
+    fn sign_request(
+        &self,
+        api: &ApiName,
+        method: &str,
+        url: &Url,
+        body: Option<&str>,
+        cookie_header: Option<&header::HeaderValue>,
+        csrf_token: Option<&header::HeaderValue>,
+    ) -> Result<Option<String>> {
+        let Some(signing_input_params) = Self::signing_input_params(api) else {
+            return Ok(None);
+        };
+        let device_id = self
+            .conf
+            .device_id
+            .as_deref()
+            .context("device_id missing in config; required for request signing")?;
+        let info = format!("{}|{}", self.conf.company_name, device_id);
+        let key = hkdf_sha256(SIGN_SECRET, &[], info.as_bytes(), SIGN_HASH_OUTPUT_SIZE);
+
+        let cookie = cookie_header
+            .map(|value| value.to_str().context("invalid Cookie header for signing"))
+            .transpose()?
+            .unwrap_or("");
+        let csrf = csrf_token
+            .map(|value| {
+                value
+                    .to_str()
+                    .context("invalid csrf-token header for signing")
+            })
+            .transpose()?
+            .unwrap_or("");
+        let body_hash = body
+            .filter(|body| !body.is_empty())
+            .map(|body| sha2::Sha256::digest(body.as_bytes()).to_vec())
+            .unwrap_or_default();
+        let vpn_token = if matches!(api, ApiName::ConnectVPN) {
+            self.cookie_value_for_url(url, "vpn-token")?
+                .context("vpn-token cookie missing; required for connect request signing")?
+        } else {
+            String::new()
+        };
+
+        let fields: [&[u8]; 10] = [
+            b"",
+            method.as_bytes(),
+            url.path().as_bytes(),
+            url.query().unwrap_or("").as_bytes(),
+            body_hash.as_slice(),
+            cookie.as_bytes(),
+            b"",
+            csrf.as_bytes(),
+            b"",
+            vpn_token.as_bytes(),
+        ];
+
+        let mut canonical = Vec::new();
+        for (index, value) in fields.iter().enumerate().skip(1) {
+            if (signing_input_params & (1 << index)) != 0 {
+                canonical.extend_from_slice(value);
+            }
+        }
+
+        let signing_result = hmac_sha256(&key, &canonical);
+        Ok(Some(encode_sign_header(
+            signing_input_params,
+            &signing_result,
+        )))
+    }
+
     async fn request<T: DeserializeOwned + fmt::Debug>(
         &mut self,
         api: ApiName,
         body: Option<Map<String, Value>>,
     ) -> Result<Resp<T>> {
         let url = self.api_url.get_api_url(&api);
+        let parsed_url = Url::from_str(&url).with_context(|| format!("invalid url for {api:?}"))?;
+        let body = body
+            .map(|body| {
+                serde_json::to_string(&body)
+                    .with_context(|| format!("failed to serialize request body for {api:?}"))
+            })
+            .transpose()?;
+        let method = if body.is_some() { "POST" } else { "GET" };
+        let cookie_header = self.cookie_header_for_url(&parsed_url)?;
+        let csrf_token = self.csrf_token_for_url(&parsed_url)?;
+        let sign_header = self.sign_request(
+            &api,
+            method,
+            &parsed_url,
+            body.as_deref(),
+            cookie_header.as_ref(),
+            csrf_token.as_ref(),
+        )?;
 
-        let rb = match body {
-            Some(body) => {
-                let body = serde_json::to_string(&body)
-                    .with_context(|| format!("failed to serialize request body for {api:?}"))?;
-                self.c
-                    .post(url)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(body)
-            }
+        let mut rb = match body {
+            Some(body) => self
+                .c
+                .post(url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body),
             None => self.c.get(url),
         };
+        if let Some(cookie_header) = cookie_header {
+            rb = rb.header(header::COOKIE, cookie_header);
+        }
+        if let Some(csrf_token) = csrf_token {
+            rb = rb.header("csrf-token", csrf_token);
+        }
+        if let Some(sign_header) = sign_header {
+            rb = rb.header("sign", sign_header);
+        }
 
         let resp = rb
             .send()
             .await
             .with_context(|| format!("request {api:?} failed"))?;
 
+        if matches!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            let status = resp.status();
+            self.handle_authentication_expired(format!("server returned HTTP {status}"))
+                .await?;
+        }
         if !resp.status().is_success() {
-            let msg = format!("logout because of bad resp code: {}", resp.status());
-            self.handle_logout_err(msg).await?;
+            bail!("request {api:?} returned HTTP {}", resp.status());
         }
 
         self.parse_time_offset_from_date_header(&resp);
@@ -331,12 +710,18 @@ impl Client {
         // expired the server returns a non-zero code (e.g. 101) with a `data`
         // whose shape doesn't match T (ListVPN, for instance, gets an object where
         // it expects an array). Deserializing straight into Resp<T> would fail here
-        // and bypass the code-based logout/retry handling, leaving a stale-session
-        // run dead with a confusing parse error. So only coerce `data` into T once
-        // we know code == 0; otherwise keep the code/message so callers can react.
-        let raw: Resp<Value> = serde_json::from_str(&text).with_context(|| {
-            format!("failed to parse response envelope for api {api:?}: {text}")
-        })?;
+        // and bypass the typed authentication-expiration handling, leaving a
+        // stale-session run dead with a confusing parse error. So only coerce
+        // `data` into T once we know code == 0.
+        let raw: Resp<Value> = serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse response envelope for api {api:?}"))?;
+        if raw.code == AUTH_EXPIRED_CODE {
+            self.handle_authentication_expired(format!(
+                "server returned authentication-expired code {AUTH_EXPIRED_CODE}"
+            ))
+            .await?;
+            unreachable!("authentication expiration always returns an error");
+        }
         let data = match (raw.code, raw.data) {
             (0, Some(v)) => Some(
                 serde_json::from_value::<T>(v)
@@ -350,7 +735,13 @@ impl Client {
             data,
             action: raw.action,
         };
-        log::debug!("api {:#?} resp: {:#?}", api, resp);
+        log::debug!(
+            "api {:?} response: code={}, has_data={}, has_action={}",
+            api,
+            resp.code,
+            resp.data.is_some(),
+            resp.action.is_some()
+        );
         Ok(resp)
     }
 
@@ -387,7 +778,7 @@ impl Client {
         matches!(self.conf.state.as_ref(), None | Some(State::Init))
     }
 
-    async fn check_tps_token(&mut self, token: &String) -> Result<String> {
+    async fn check_tps_token(&mut self, token: &str) -> Result<TpsTokenStatus> {
         // tps confirmed, try to login with token
         let mut m = Map::new();
         m.insert("token".to_string(), json!(token));
@@ -396,15 +787,66 @@ impl Client {
             .request::<RespLogin>(ApiName::TpsTokenCheck, Some(m))
             .await?;
         match resp.code {
-            0 => resp
-                .data
-                .context("tps token check missing redirect url")
-                .map(|d| d.url),
-            _ => {
-                let msg = resp
-                    .message
-                    .unwrap_or_else(|| "tps token check failed".to_string());
-                bail!(msg)
+            0 => match resp.data.map(|data| data.url).filter(|url| !url.is_empty()) {
+                Some(url) => Ok(TpsTokenStatus::Authenticated(url)),
+                None => Ok(TpsTokenStatus::Pending),
+            },
+            // The endpoint uses an application-level non-zero response while the
+            // browser-side SSO flow has not completed. Transport/protocol errors
+            // still propagate as errors, so a broken service does not look pending.
+            _ => Ok(TpsTokenStatus::Pending),
+        }
+    }
+
+    async fn wait_for_tps_authentication(
+        &mut self,
+        token: &str,
+        poll_interval: Duration,
+        auth_timeout: Duration,
+    ) -> Result<String> {
+        tokio::time::timeout(auth_timeout, async {
+            loop {
+                tokio::time::sleep(poll_interval).await;
+                match self.check_tps_token(token).await? {
+                    TpsTokenStatus::Pending => continue,
+                    TpsTokenStatus::Authenticated(url) => return Ok(url),
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!(TpsAuthenticationTimeout))?
+    }
+
+    async fn get_otp_uri_from_tps_with_options(
+        &mut self,
+        method: &str,
+        url: &str,
+        token: &str,
+        auth_request_path: &Path,
+        poll_interval: Duration,
+        auth_timeout: Duration,
+    ) -> Result<String> {
+        match method {
+            PLATFORM_LARK | PLATFORM_OIDC => {}
+            _ => bail!("unsupported platform, please contact the developer"),
+        }
+
+        let event_id = new_auth_event_id();
+        write_auth_request(auth_request_path, &event_id, method, url)?;
+        log::info!("authentication requested: event_id={event_id}");
+
+        let result = self
+            .wait_for_tps_authentication(token, poll_interval, auth_timeout)
+            .await;
+        match result {
+            Ok(otp_uri) => {
+                remove_auth_request(auth_request_path, &event_id)?;
+                log::info!("authentication completed: event_id={event_id}");
+                Ok(otp_uri)
+            }
+            Err(err) => {
+                log::warn!("authentication request failed: event_id={event_id}");
+                Err(err)
             }
         }
     }
@@ -412,27 +854,18 @@ impl Client {
     async fn get_otp_uri_from_tps(
         &mut self,
         method: &str,
-        url: &String,
-        token: &String,
+        url: &str,
+        token: &str,
     ) -> Result<String> {
-        log::info!("old token is: {token}");
-        log::info!("please scan the QR code or visit the following link to auth corplink:\n{url}");
-        match TerminalQrCode::from_bytes(url.as_bytes()) {
-            Ok(qr) => qr.print(),
-            Err(e) => {log::warn!("failed to generate qr code: {e}");}
-        }
-        match method {
-            PLATFORM_LARK | PLATFORM_OIDC => {
-                log::info!("press enter if you finish auth");
-                let stdin = io::stdin();
-                stdin.lines().next();
-                self.check_tps_token(token).await
-            }
-            _ => {
-                // TODO: add all tps login support
-                bail!("unsupported platform, please contact the developer");
-            }
-        }
+        self.get_otp_uri_from_tps_with_options(
+            method,
+            url,
+            token,
+            Path::new(AUTH_REQUEST_PATH),
+            TPS_AUTH_POLL_INTERVAL,
+            TPS_AUTH_TIMEOUT,
+        )
+        .await
     }
 
     async fn corplink_login(&mut self) -> Result<String> {
@@ -582,7 +1015,6 @@ impl Client {
                         let url = Url::parse(&otp_uri).context("failed to parse otp uri")?;
                         for (k, v) in url.query_pairs() {
                             if k == "secret" {
-                                log::info!("got 2fa token: {}", &v);
                                 self.conf.code = Some(v.to_string());
                                 self.conf.save().await?;
                                 break;
@@ -620,11 +1052,13 @@ impl Client {
         }
         for method in resp.login_orders {
             let otp_uri = self.get_otp_uri_by_otp(&tps_login, &method).await;
-            if let Err(e) = otp_uri {
-                log::warn!("failed to login with method {method}: {e}");
-                continue;
-            }
-            let otp_uri = otp_uri?;
+            let otp_uri = match otp_uri {
+                Ok(otp_uri) => otp_uri,
+                Err(err) => {
+                    log::warn!("failed to login with method {method}: {err}");
+                    continue;
+                }
+            };
             if otp_uri.is_empty() {
                 log::info!("no otp code from server, will ask for 2fa code when connecting");
                 self.change_state(State::Login).await?;
@@ -635,7 +1069,6 @@ impl Client {
             let url = Url::parse(&otp_uri).context("failed to parse otp uri")?;
             for (k, v) in url.query_pairs() {
                 if k == "secret" {
-                    log::info!("got 2fa token: {}", &v);
                     self.conf.code = Some(v.to_string());
                     self.conf.save().await?;
                     break;
@@ -754,18 +1187,17 @@ impl Client {
         match resp.code {
             0 => Ok(resp.data.context("email login response missing data")?.url),
             _ => bail!(format!(
-                "failed to login with email code {}: {}",
-                code,
+                "failed to login with email code: {}",
                 resp.message.unwrap_or_else(|| "unknown error".to_string())
             )),
         }
     }
 
-    async fn handle_logout_err(&mut self, msg: String) -> Result<()> {
+    async fn handle_authentication_expired(&mut self, detail: String) -> Result<()> {
         self.change_state(State::Init)
             .await
-            .context("failed to reset state after logout")?;
-        bail!("operation failed because of logout: {msg}")
+            .context("failed to reset state after authentication expiration")?;
+        Err(AuthenticationExpired { detail }.into())
     }
 
     async fn list_vpn(&mut self) -> Result<Vec<RespVpnInfo>> {
@@ -774,11 +1206,11 @@ impl Client {
             .await?;
         match resp.code {
             0 => resp.data.context("list vpn response missing data"),
-            101 => {
+            AUTH_EXPIRED_CODE => {
                 let msg = resp
                     .message
-                    .unwrap_or_else(|| "logout required".to_string());
-                self.handle_logout_err(msg).await?;
+                    .unwrap_or_else(|| "authentication expired".to_string());
+                self.handle_authentication_expired(msg).await?;
                 unreachable!()
             }
             _ => bail!(format!(
@@ -1003,11 +1435,7 @@ impl Client {
                 let offset = self.date_offset_sec / TIME_STEP as i32;
                 let raw_otp = totp_offset(code.as_slice(), offset);
                 otp = format!("{:06}", raw_otp.code);
-                log::info!(
-                    "2fa code generated: {}, {} seconds left",
-                    &otp,
-                    raw_otp.secs_left
-                );
+                log::info!("2fa code generated, {} seconds left", raw_otp.secs_left);
             }
         }
         if otp.is_empty() {
@@ -1030,11 +1458,11 @@ impl Client {
             .await?;
         match resp.code {
             0 => resp.data.context("connect vpn response missing data"),
-            101 => {
+            AUTH_EXPIRED_CODE => {
                 let msg = resp
                     .message
-                    .unwrap_or_else(|| "logout required".to_string());
-                self.handle_logout_err(msg).await?;
+                    .unwrap_or_else(|| "authentication expired".to_string());
+                self.handle_authentication_expired(msg).await?;
                 unreachable!()
             }
             _ => bail!(format!(
@@ -1190,22 +1618,14 @@ impl Client {
             }
         };
 
-        let mut additional_routes = self
-            .conf
-            .vpn_additional_routes
-            .clone()
-            .unwrap_or_default();
+        let mut additional_routes = self.conf.vpn_additional_routes.clone().unwrap_or_default();
         if let Some(domains) = self.conf.vpn_additional_domains.as_deref() {
-            additional_routes
-                .extend(resolve_additional_domains(domains, has_ipv6_address).await);
+            additional_routes.extend(resolve_additional_domains(domains, has_ipv6_address).await);
         }
         if !additional_routes.is_empty() {
             let before = allowed_ips.len();
-            allowed_ips = merge_additional_routes(
-                allowed_ips,
-                &additional_routes,
-                has_ipv6_address,
-            );
+            allowed_ips =
+                merge_additional_routes(allowed_ips, &additional_routes, has_ipv6_address);
             log::info!(
                 "additional VPN routes merged: {} -> {} entries",
                 before,
@@ -1415,6 +1835,8 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1424,10 +1846,46 @@ mod tests {
     use tokio::sync::{oneshot, Barrier};
     use tokio::time::{sleep, timeout};
 
-    use super::{merge_additional_routes, resolve_additional_domains, Client, ReqwestCookieStore};
+    use super::{
+        encode_sign_header, hkdf_sha256, merge_additional_routes, remove_auth_request,
+        resolve_additional_domains, write_auth_request, AuthRequest, Client, ReqwestCookieStore,
+        TpsAuthenticationTimeout, AUTH_REQUEST_SCHEMA_VERSION,
+    };
+    use crate::api::ApiUrl;
     use crate::config::Config;
     use crate::resp::RespVpnInfo;
+    use crate::state::State;
     use crate::utils::apply_route_filters;
+
+    #[test]
+    fn hkdf_sha256_matches_rfc5869_case_1() {
+        let ikm = vec![0x0b; 22];
+        let salt = hex::decode("000102030405060708090a0b0c").unwrap();
+        let info = hex::decode("f0f1f2f3f4f5f6f7f8f9").unwrap();
+        let okm = hkdf_sha256(&ikm, &salt, &info, 42);
+        assert_eq!(
+            hex::encode(okm),
+            "3cb25f25faacd57a90434f64d0362f2a\
+             2d2d0a90cf1a5a4c5db02d56ecc4c5bf\
+             34007208d5b887185865"
+                .replace(char::is_whitespace, "")
+        );
+    }
+
+    #[test]
+    fn sign_header_uses_observed_wire_shape() {
+        let header = encode_sign_header(510, &[0x11; 32]);
+        assert!(header.starts_with("v1;"));
+        let encoded = header.trim_start_matches("v1;");
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(
+            hex::encode(bytes),
+            format!("080118fe032220{}", "11".repeat(32))
+        );
+    }
 
     async fn start_probe_server(
         barrier: Arc<Barrier>,
@@ -1467,6 +1925,50 @@ mod tests {
         (port, request_rx, task)
     }
 
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut buffer).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+    }
+
+    async fn start_tps_server(
+        responses: Vec<&'static str>,
+        repeat_last: bool,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        assert!(!responses.is_empty());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let mut response_index = 0;
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_request(&mut stream).await;
+                let body = responses[response_index];
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+
+                if response_index + 1 < responses.len() {
+                    response_index += 1;
+                } else if !repeat_last {
+                    break;
+                }
+            }
+        });
+        (port, task)
+    }
+
     fn vpn_info(port: u16, name: &str) -> RespVpnInfo {
         RespVpnInfo {
             api_port: port,
@@ -1503,6 +2005,192 @@ mod tests {
         Client::new(conf).unwrap()
     }
 
+    fn test_client_for_server(port: u16) -> Client {
+        let mut client = test_client();
+        client.conf.server = Some(format!("http://127.0.0.1:{port}"));
+        client.api_url = ApiUrl::new(&client.conf).unwrap();
+        client
+    }
+
+    fn temporary_auth_request_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("corplink-auth-request-{name}-{unique}"))
+            .join("auth-request.json")
+    }
+
+    fn remove_auth_test_directory(path: &Path) {
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn auth_request_is_atomic_root_only_json_and_event_guarded() {
+        let path = temporary_auth_request_path("json");
+        write_auth_request(
+            &path,
+            "0123456789abcdef",
+            "OIDC",
+            "https://login.example.test/secret",
+        )
+        .unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let request: AuthRequest<'_> = serde_json::from_str(&contents).unwrap();
+        assert_eq!(request.schema_version, AUTH_REQUEST_SCHEMA_VERSION);
+        assert_eq!(request.event_id, "0123456789abcdef");
+        assert_eq!(request.method, "OIDC");
+        assert_eq!(request.url, "https://login.example.test/secret");
+        assert!(chrono::DateTime::parse_from_rfc3339(&request.created_at).is_ok());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&contents)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            5
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(!path
+            .parent()
+            .unwrap()
+            .join(".auth-request.json.0123456789abcdef.tmp")
+            .exists());
+
+        remove_auth_request(&path, "different-event").unwrap();
+        assert!(path.exists());
+        remove_auth_request(&path, "0123456789abcdef").unwrap();
+        assert!(!path.exists());
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sso_polling_transitions_from_pending_to_success_and_removes_request() {
+        let (port, server) = start_tps_server(
+            vec![
+                r#"{"code":1,"message":"pending"}"#,
+                r#"{"code":0,"data":{"url":"otpauth://totp/test?secret=SAFE"}}"#,
+            ],
+            false,
+        )
+        .await;
+        let mut client = test_client_for_server(port);
+        let path = temporary_auth_request_path("success");
+
+        let result = client
+            .get_otp_uri_from_tps_with_options(
+                "OIDC",
+                "https://login.example.test/request",
+                "opaque-token",
+                &path,
+                Duration::from_millis(5),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, "otpauth://totp/test?secret=SAFE");
+        assert!(!path.exists());
+        server.await.unwrap();
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sso_polling_times_out_and_keeps_request() {
+        let (port, server) =
+            start_tps_server(vec![r#"{"code":1,"message":"pending"}"#], true).await;
+        let mut client = test_client_for_server(port);
+        let path = temporary_auth_request_path("timeout");
+
+        let error = client
+            .get_otp_uri_from_tps_with_options(
+                "OIDC",
+                "https://login.example.test/request",
+                "opaque-token",
+                &path,
+                Duration::from_millis(5),
+                Duration::from_millis(30),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<TpsAuthenticationTimeout>().is_some());
+        assert!(path.exists());
+        server.abort();
+        remove_auth_test_directory(&path);
+    }
+
+    #[tokio::test]
+    async fn sso_polling_propagates_network_errors_and_keeps_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut client = test_client_for_server(port);
+        let path = temporary_auth_request_path("network");
+
+        let error = client
+            .get_otp_uri_from_tps_with_options(
+                "OIDC",
+                "https://login.example.test/request",
+                "opaque-token",
+                &path,
+                Duration::ZERO,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<TpsAuthenticationTimeout>().is_none());
+        assert!(format!("{error:#}").contains("request TpsTokenCheck failed"));
+        assert!(path.exists());
+        remove_auth_test_directory(&path);
+    }
+
+    #[tokio::test]
+    async fn authentication_expiration_is_a_typed_error_and_resets_state() {
+        use anyhow::Context;
+
+        let (port, server) =
+            start_tps_server(vec![r#"{"code":101,"message":"session expired"}"#], false).await;
+        let mut client = test_client_for_server(port);
+        client.conf.state = Some(State::Login);
+        let config_path = client.conf.conf_file.clone().unwrap();
+
+        let error = client
+            .check_tps_token("opaque-token")
+            .await
+            .context("login failed")
+            .unwrap_err();
+
+        assert!(error
+            .downcast_ref::<super::AuthenticationExpired>()
+            .is_some());
+        assert!(client.need_login());
+        server.await.unwrap();
+        fs::remove_file(config_path).unwrap();
+    }
+
     #[tokio::test]
     async fn concurrent_default_probe_preserves_order_and_isolates_cookie_state() {
         let barrier = Arc::new(Barrier::new(3));
@@ -1535,8 +2223,8 @@ mod tests {
         let second_request = second_request.await.unwrap().to_ascii_lowercase();
         assert!(first_request.contains("cookie: device_id=test-device"));
         assert!(second_request.contains("cookie: device_id=test-device"));
-        assert!(first_request.contains("user-agent: corplink/201000 "));
-        assert!(second_request.contains("user-agent: corplink/201000 "));
+        assert!(first_request.contains("user-agent: corplink/3.3.17 "));
+        assert!(second_request.contains("user-agent: corplink/3.3.17 "));
 
         {
             let cookie_store = client.cookie.lock().unwrap();

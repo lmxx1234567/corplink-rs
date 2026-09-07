@@ -1,6 +1,12 @@
 # output
 /target/
 
+# local distribution artifacts
+/dist/
+
+# macOS metadata
+.DS_Store
+
 # JetBrains IDE file
 /.idea/
 
