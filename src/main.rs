@@ -2,6 +2,7 @@ mod api;
 mod client;
 mod config;
 mod dns;
+mod renew;
 mod resp;
 mod state;
 mod template;
@@ -23,35 +24,28 @@ use anyhow::{anyhow, Context, Result};
 use client::{AuthenticationExpired, Client};
 use config::{Config, WgConf};
 
-fn print_usage_and_exit(name: &str, conf: &str) {
-    println!("usage:\n\t{} {}", name, conf);
+fn print_usage_and_exit(name: &str, conf: &str) -> ! {
+    println!("usage:\n\t{name} [--renew-if-requested] {conf}\n\t{name} --control-capabilities");
     exit(1);
 }
 
-fn parse_arg() -> String {
-    let mut conf_file = String::from("config.json");
+fn parse_arg() -> (String, bool) {
+    let mut conf_file = None;
+    let mut renew_if_requested = false;
     let mut args = env::args();
-    // pop name
-    let name = args.next().unwrap();
-    match args.len() {
-        0 => {}
-        1 => {
-            // pop arg
-            let arg = args.next().unwrap();
-            match arg.as_str() {
-                "-h" | "--help" => {
-                    print_usage_and_exit(&name, &conf_file);
-                }
-                _ => {
-                    conf_file = arg;
-                }
-            }
-        }
-        _ => {
-            print_usage_and_exit(&name, &conf_file);
+    let name = args.next().unwrap_or_else(|| "corplink-rs".into());
+    for arg in args {
+        match arg.as_str() {
+            "--renew-if-requested" if !renew_if_requested => renew_if_requested = true,
+            "-h" | "--help" => print_usage_and_exit(&name, "config.json"),
+            _ if !arg.starts_with('-') && conf_file.is_none() => conf_file = Some(arg),
+            _ => print_usage_and_exit(&name, "config.json"),
         }
     }
-    conf_file
+    (
+        conf_file.unwrap_or_else(|| "config.json".into()),
+        renew_if_requested,
+    )
 }
 
 pub const EPERM: i32 = 1;
@@ -60,6 +54,10 @@ pub const ETIMEDOUT: i32 = 110;
 
 #[tokio::main]
 async fn main() {
+    if env::args().skip(1).collect::<Vec<_>>() == ["--control-capabilities"] {
+        println!("renew-marker-v1");
+        return;
+    }
     if let Err(err) = run().await {
         log::error!("{:#}", err);
         exit(EPERM);
@@ -73,7 +71,7 @@ async fn run() -> Result<()> {
 
     print_version();
 
-    let conf_file = parse_arg();
+    let (conf_file, renew_if_requested) = parse_arg();
     let mut conf = Config::from_file(&conf_file)
         .await
         .context("failed to load config")?;
@@ -120,7 +118,19 @@ async fn run() -> Result<()> {
 
     let with_wg_log = conf.debug_wg.unwrap_or_default();
     let platform = conf.platform.clone();
-    let mut c = Client::new(conf).context("failed to initialize client")?;
+    let renew_operation = if renew_if_requested {
+        renew::consume_request()?
+    } else {
+        None
+    };
+    let force_renew = renew_operation.is_some();
+    let mut c = if force_renew {
+        log::info!("starting explicitly requested authentication renewal");
+        Client::new_with_renew(conf, true)
+    } else {
+        Client::new(conf)
+    }
+    .context("failed to initialize client")?;
     let mut authentication_retry = true;
     let wg_conf: Option<WgConf>;
 
@@ -153,12 +163,21 @@ async fn run() -> Result<()> {
         };
     }
     let wg_conf = wg_conf.ok_or_else(|| anyhow!("wg conf missing after connect loop"))?;
+    if let Some(operation_id) = renew_operation.as_deref() {
+        renew::write_completed(operation_id)?;
+    }
     let protocol = wg_conf.protocol;
     let mut uapi = wg::UAPIClient { name: name.clone() };
     if let Some(listen) = &socks5_listen {
         log::info!("start wg-corplink (netstack/socks5) on {}", listen);
-        wg::start_wg_go_netstack(&wg_conf, listen, &socks5_username, &socks5_password, with_wg_log)
-            .context("failed to start wg-corplink in netstack mode")?;
+        wg::start_wg_go_netstack(
+            &wg_conf,
+            listen,
+            &socks5_username,
+            &socks5_password,
+            with_wg_log,
+        )
+        .context("failed to start wg-corplink in netstack mode")?;
         uapi.config_wg_netstack(&wg_conf)
             .await
             .context("failed to config netstack interface with uapi")?;
