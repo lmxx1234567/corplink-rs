@@ -247,8 +247,8 @@ RUST_LOG=debug ./corplink-rs config.json
 
 - **无需 root / 不改系统路由和 DNS / 不建网卡**，适合容器、无权限环境或只想给单个应用走 VPN 的场景
 - 支持 TCP `CONNECT` 和 UDP `ASSOCIATE`，域名在隧道内解析（用 `--socks5-hostname` 让客户端把 DNS 也交给代理）
-- 隧道 DNS 的 UDP 查询失败时会尝试同一服务器的 TCP 53 端口；超时回退可能增加约 5 秒等待，不使用系统 DNS
-- 域名连接保留全部解析地址，优先 IPv4，失败后在总超时预算内尝试后续地址；IPv6-only 域名仍可连接
+- 隧道 DNS 的 UDP 查询超时时会尝试同一服务器的 TCP 53 端口；超时回退可能增加约 5 秒等待，不使用系统 DNS
+- 域名连接保留全部解析地址，从 IPv4 开始交错尝试 IPv4/IPv6，失败后在总超时预算内尝试后续地址；IPv6-only 域名仍可连接
 - 可选用户名/密码认证（RFC 1929）：设置 `socks5_username`（及 `socks5_password`）即开启；留空则免认证
 
 ```sh
