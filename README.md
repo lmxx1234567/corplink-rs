@@ -73,7 +73,7 @@ systemctl enable corplink-rs.service
 systemctl start corplink-rs@test.service
 ```
 
-使用 `lark` 或 `OIDC` 登录时，systemd 日志只会输出本次认证的 `event_id`。完整认证地址会以 `0600` 权限原子写入 `/run/corplink-rs/auth-request.json`，其中包含 `schema_version`、`event_id`、`created_at`、`method` 和 `url`。客户端每 5 秒检查一次认证状态，最长等待 10 分钟；认证成功后立即删除该文件并继续建立 VPN。超时或网络错误时文件会保留，便于外部监控发现并处理。
+使用 `lark` 或 `OIDC` 登录时，systemd 日志只会输出本次认证的 `event_id`。完整认证地址会以 `0600` 权限原子写入 `/run/corplink-rs/auth-request.json`，其中包含 `schema_version`、`event_id`、`created_at`、`process_id`、`method` 和 `url`。客户端每 5 秒检查一次认证状态，最长等待 10 分钟；认证成功后立即删除该文件并继续建立 VPN。超时或网络错误时文件会保留，便于外部监控发现并处理。
 
 ## windows 使用说明
 
@@ -440,3 +440,22 @@ graph TD;
 [5]: https://github.com/PinkD/wireguard-go
 [6]: https://www.wintun.net/
 [7]: https://github.com/tauri-apps/tauri
+
+### 外部控制器主动重新认证
+
+`corplink-rs --control-capabilities` 在 Unix 上输出 `renew-marker-v1`，不支持的平台输出为空；无需读取配置或启动 VPN。
+使用 `corplink-rs --renew-if-requested /path/to/config.json` 启动时，客户端检查
+`/run/corplink-rs/renew-request.json`。无请求文件时沿用正常登录流程。
+
+控制器应先备份配置和会话、停止客户端，再原子写入 root 所有、权限 `0600` 的普通文件：
+
+```json
+{"operation_id":"0123456789abcdef0123456789abcdef"}
+```
+
+请求最大 1024 字节，operation_id 必须是 32 位十六进制字符串；拒绝符号链接及不安全权限。
+客户端消费请求后仅在内存中忽略旧登录状态与 Cookie，不主动删除磁盘会话。
+认证及连接配置取得成功后，原子写入权限 `0600` 的 `renew-completed.json`，
+包含 `operation_id` 和 `process_id`。这不是数据面健康证明，控制器仍需验证实际代理请求。
+一次性请求不会在进程自动重启后重放；控制器应分别记录原操作结果及后续恢复，
+且不可仅凭端口监听或旧回执宣布 renew 成功。

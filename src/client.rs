@@ -78,6 +78,7 @@ struct AuthRequest<'a> {
     schema_version: u32,
     event_id: &'a str,
     created_at: String,
+    process_id: u32,
     method: &'a str,
     url: &'a str,
 }
@@ -116,6 +117,7 @@ fn write_auth_request(path: &Path, event_id: &str, method: &str, url: &str) -> R
         schema_version: AUTH_REQUEST_SCHEMA_VERSION,
         event_id,
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        process_id: std::process::id(),
         method,
         url,
     };
@@ -403,6 +405,15 @@ pub async fn get_company_url(code: &str) -> anyhow::Result<RespCompany> {
 
 impl Client {
     pub fn new(conf: Config) -> Result<Client> {
+        Self::new_with_renew(conf, false)
+    }
+
+    /// Ignore old login state and cookies in memory; the controller backs up disk state first.
+    pub fn new_with_renew(mut conf: Config, force_renew: bool) -> Result<Client> {
+        if force_renew {
+            conf.state = Some(State::Init);
+            conf.code = None;
+        }
         let f = conf.conf_file.clone().context("config file path missing")?;
         let interface_name = conf
             .interface_name
@@ -415,7 +426,9 @@ impl Client {
         let cookie_file = dir.join(format!("{}_{}", interface_name, COOKIE_FILE_SUFFIX));
         log::info!("cookie file is: {}", cookie_file.to_string_lossy());
 
-        let mut cookie_store = {
+        let mut cookie_store = if force_renew {
+            CookieStore::default()
+        } else {
             let file = fs::File::open(&cookie_file).map(io::BufReader::new);
             match file {
                 Ok(file) => CookieStore::load_json_all(file).unwrap_or_else(|e| {
@@ -2012,6 +2025,29 @@ mod tests {
         client
     }
 
+    #[test]
+    fn explicit_renew_ignores_cached_login_without_deleting_disk_state() {
+        let path = temporary_auth_request_path("renew-client");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conf_path = path.parent().unwrap().join("config.json");
+        let conf: Config = serde_json::from_value(json!({
+            "company_name": "test", "username": "test", "server": "https://example.test",
+            "interface_name": "test", "state": "Login", "code": "old-code"
+        })).unwrap();
+        let mut conf = conf;
+        conf.conf_file = Some(conf_path.to_string_lossy().into_owned());
+        fs::write(&conf_path, "preserved configuration").unwrap();
+        let cookie_path = path.parent().unwrap().join("test_cookies.json");
+        fs::write(&cookie_path, "preserved cookie backup").unwrap();
+        let client = Client::new_with_renew(conf, true).unwrap();
+        assert!(client.need_login());
+        assert!(client.conf.code.is_none());
+        assert_eq!(fs::read_to_string(&conf_path).unwrap(), "preserved configuration");
+        assert_eq!(fs::read_to_string(&cookie_path).unwrap(), "preserved cookie backup");
+        assert_eq!(client.cookie.lock().unwrap().iter_any().count(), 0);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     fn temporary_auth_request_path(name: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2043,6 +2079,7 @@ mod tests {
         let contents = fs::read_to_string(&path).unwrap();
         let request: AuthRequest<'_> = serde_json::from_str(&contents).unwrap();
         assert_eq!(request.schema_version, AUTH_REQUEST_SCHEMA_VERSION);
+        assert_eq!(request.process_id, std::process::id());
         assert_eq!(request.event_id, "0123456789abcdef");
         assert_eq!(request.method, "OIDC");
         assert_eq!(request.url, "https://login.example.test/secret");
@@ -2053,7 +2090,7 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .len(),
-            5
+            6
         );
 
         #[cfg(unix)]
