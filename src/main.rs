@@ -2,6 +2,7 @@ mod api;
 mod client;
 mod config;
 mod dns;
+mod qrcode;
 mod renew;
 mod resp;
 mod state;

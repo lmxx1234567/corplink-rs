@@ -27,6 +27,7 @@ use crate::config::{
     Config, WgConf, PLATFORM_CORPLINK, PLATFORM_CORPLINK_V1, PLATFORM_LARK, PLATFORM_LDAP,
     PLATFORM_OIDC, STRATEGY_DEFAULT, STRATEGY_LATENCY,
 };
+use crate::qrcode::TerminalQrCode;
 use crate::resp::*;
 use crate::state::State;
 use crate::totp::{totp_offset, TIME_STEP};
@@ -802,12 +803,23 @@ impl Client {
         match resp.code {
             0 => match resp.data.map(|data| data.url).filter(|url| !url.is_empty()) {
                 Some(url) => Ok(TpsTokenStatus::Authenticated(url)),
-                None => Ok(TpsTokenStatus::Pending),
+                None if self.conf.poll_tps_auth.is_none() => Ok(TpsTokenStatus::Pending),
+                None => bail!("tps token check missing redirect url"),
             },
             // The endpoint uses an application-level non-zero response while the
             // browser-side SSO flow has not completed. Transport/protocol errors
             // still propagate as errors, so a broken service does not look pending.
-            _ => Ok(TpsTokenStatus::Pending),
+            code => {
+                let msg = resp.message.unwrap_or_else(|| "tps token check failed".to_string());
+                if self.conf.poll_tps_auth.is_none()
+                    || (self.conf.poll_tps_auth == Some(true)
+                        && (code == 3040 || msg == "用户未登录"))
+                {
+                    Ok(TpsTokenStatus::Pending)
+                } else {
+                    bail!(msg)
+                }
+            },
         }
     }
 
@@ -870,6 +882,27 @@ impl Client {
         url: &str,
         token: &str,
     ) -> Result<String> {
+        // An absent setting preserves this fork's controller receipt workflow.
+        // Explicit settings select upstream's interactive / generic polling modes.
+        if let Some(poll) = self.conf.poll_tps_auth {
+            log::info!("please scan the QR code or visit the following link to auth corplink:\n{url}");
+            match TerminalQrCode::from_bytes(url.as_bytes()) {
+                Ok(qr) => qr.print(),
+                Err(e) => log::warn!("failed to generate qr code: {e}"),
+            }
+            if poll {
+                return self.wait_for_tps_authentication(
+                    token, TPS_AUTH_POLL_INTERVAL, Duration::from_secs(180),
+                ).await;
+            }
+            log::info!("finish the auth above, then press enter ({method})");
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).context("failed to read authentication confirmation")?;
+            return match self.check_tps_token(token).await? {
+                TpsTokenStatus::Authenticated(url) => Ok(url),
+                TpsTokenStatus::Pending => bail!("tps token check missing redirect url"),
+            };
+        }
         self.get_otp_uri_from_tps_with_options(
             method,
             url,
@@ -1004,7 +1037,10 @@ impl Client {
         let enc = utils::feilian_v1_encrypt_password(&password);
         let mut m = Map::new();
         m.insert("login_scene".to_string(), json!(PLATFORM_CORPLINK));
-        m.insert("account_type".to_string(), json!("userid"));
+        m.insert(
+            "account_type".to_string(),
+            json!(self.conf.account_type.as_deref().unwrap_or("userid")),
+        );
         m.insert("account".to_string(), json!(&self.conf.username));
         m.insert("password".to_string(), json!(enc));
 
@@ -2151,6 +2187,50 @@ mod tests {
         assert!(!path.exists());
         server.await.unwrap();
         fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_tps_polling_supports_other_platforms() {
+        let (port, server) = start_tps_server(vec![
+            r#"{"code":3040,"message":"pending"}"#,
+            r#"{"code":0,"data":{"url":"otpauth://totp/test?secret=SAFE"}}"#,
+        ], false).await;
+        let mut client = test_client_for_server(port);
+        client.conf.poll_tps_auth = Some(true);
+        let result = client.get_otp_uri_from_tps(
+            "weixin", "https://login.example.test/request", "opaque-token",
+        ).await.unwrap();
+        assert_eq!(result, "otpauth://totp/test?secret=SAFE");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_tps_modes_propagate_errors_and_missing_redirects() {
+        for poll in [true, false] {
+            for body in [
+                r#"{"code":4001,"message":"ticket expired"}"#,
+                r#"{"code":0}"#,
+                r#"{"code":0,"data":{"url":""}}"#,
+            ] {
+                let (port, server) = start_tps_server(vec![body], false).await;
+                let mut client = test_client_for_server(port);
+                client.conf.poll_tps_auth = Some(poll);
+                assert!(client.check_tps_token("opaque-token").await.is_err());
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_tps_polling_accepts_pending_message() {
+        let (port, server) = start_tps_server(
+            vec![r#"{"code":42,"message":"用户未登录"}"#], false,
+        ).await;
+        let mut client = test_client_for_server(port);
+        client.conf.poll_tps_auth = Some(true);
+        assert_eq!(client.check_tps_token("opaque-token").await.unwrap(),
+            super::TpsTokenStatus::Pending);
+        server.await.unwrap();
     }
 
     #[tokio::test]

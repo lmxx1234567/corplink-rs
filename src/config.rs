@@ -105,6 +105,16 @@ pub struct Config {
     /// head-of-line blocking), forcing "udp" can be far faster there. Leave unset to keep the
     /// default (follow server `protocol_mode`: 1 => tcp, otherwise udp).
     pub force_protocol: Option<String>,
+    /// Poll the TPS auth result until approval (5s interval, 180s timeout)
+    /// instead of waiting for Enter and checking once. Opt-in: some servers
+    /// invalidate the auth ticket on the first check.
+    /// Omit to retain the fork's lark/OIDC controller receipt flow (10 minutes).
+    /// Explicit true/false use terminal login without controller receipts.
+    pub poll_tps_auth: Option<bool>,
+    /// Account type sent in the `feilian_v1` login request. Defaults to
+    /// "userid". Deployments whose login setting advertises a different
+    /// account type (e.g. "email") can override it here.
+    pub account_type: Option<String>,
 }
 
 impl fmt::Display for Config {

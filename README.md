@@ -73,7 +73,7 @@ systemctl enable corplink-rs.service
 systemctl start corplink-rs@test.service
 ```
 
-使用 `lark` 或 `OIDC` 登录时，systemd 日志只会输出本次认证的 `event_id`。完整认证地址会以 `0600` 权限原子写入 `/run/corplink-rs/auth-request.json`，其中包含 `schema_version`、`event_id`、`created_at`、`process_id`、`method` 和 `url`。客户端每 5 秒检查一次认证状态，最长等待 10 分钟；认证成功后立即删除该文件并继续建立 VPN。超时或网络错误时文件会保留，便于外部监控发现并处理。
+未设置 `poll_tps_auth`、使用 `lark` 或 `OIDC` 登录时，systemd 日志只会输出本次认证的 `event_id`。完整认证地址会以 `0600` 权限原子写入 `/run/corplink-rs/auth-request.json`，其中包含 `schema_version`、`event_id`、`created_at`、`process_id`、`method` 和 `url`。客户端每 5 秒检查一次认证状态，最长等待 10 分钟；认证成功后立即删除该文件并继续建立 VPN。超时或网络错误时文件会保留，便于外部监控发现并处理。
 
 ## windows 使用说明
 
@@ -237,7 +237,18 @@ RUST_LOG=debug ./corplink-rs config.json
   // thresholds) for them in /api/vpn/list. since WireGuard-over-TCP can collapse to a few
   // KB/s on a lossy uplink (TCP-over-TCP), forcing "udp" can be far faster there.
   // leave unset to follow the server's protocol_mode (1 => tcp, otherwise udp).
-  "force_protocol": "udp"
+  "force_protocol": "udp",
+  // poll the TPS auth result until approval (5s interval, 180s timeout) instead
+  // of waiting for Enter; opt-in because some servers invalidate the auth
+  // ticket on the first check. applies to every TPS platform (lark/oidc/weixin/...)
+  // omit this option to retain this fork's lark/OIDC controller receipt flow
+  // (10-minute timeout); explicit true/false use upstream terminal login
+  // and do not write auth-request.json
+  // "poll_tps_auth": false,
+  // account type sent in the feilian_v1 login request ("userid" by default).
+  // deployments whose login setting advertises another account type (e.g. "email")
+  // can override it here
+  "account_type": "userid"
 }
 ```
 
